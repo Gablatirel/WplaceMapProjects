@@ -1,10 +1,10 @@
 <template>
 	<Button
 		severity="primary"
-		size="large"
+		:size="isMobile ? 'small' : 'large'"
 		raised
 		rounded
-		:class="['paint-button', { 'paint-button-shimmer': hasPendingPixels }]"
+		class="paint-button"
 		@click="$emit('click')"
 	>
 		<Icon name="paint" class="paint-button-icon" />
@@ -18,6 +18,7 @@
 <script setup lang="ts">
 import Button from "primevue/button";
 import { computed } from "vue";
+import { useViewport } from "~/composables/useViewport";
 
 const props = defineProps<{
 	charges: number;
@@ -26,6 +27,8 @@ const props = defineProps<{
 	timeUntilNext: string;
 	pendingPixels?: number;
 }>();
+
+const { isMobile } = useViewport();
 
 const hasPendingPixels = computed(() => (props.pendingPixels ?? 0) > 0);
 
@@ -41,7 +44,7 @@ defineEmits<{
 }
 
 .paint-button-icon {
-	font-size: 1.5rem;
+	font-size: 1.5em;
 }
 
 .paint-button-time {

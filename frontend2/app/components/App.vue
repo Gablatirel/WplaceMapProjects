@@ -1,6 +1,9 @@
 <template>
 	<div
-		class="app-container"
+		:class="[
+			'app-container',
+			isMobile ? 'app-container--mobile' : null
+		]"
 		:style="{
 			'visibility': isLoading ? 'hidden' : undefined
 		}"
@@ -8,7 +11,7 @@
 		<Toast />
 
 		<ClientOnly>
-			<Map
+			<MapComponent
 				ref="mapRef"
 				:initial-location="initialLocation"
 				:pixels="pixels"
@@ -139,6 +142,7 @@
 				class="app-overlays-paint"
 			>
 				<PaintButton
+					v-if="!isPaintOpen"
 					:charges="currentCharges ?? 0"
 					:max-charges="maxCharges ?? 0"
 					:is-drawing="isPaintOpen"
@@ -157,12 +161,13 @@
 					:is-eraser-mode="isEraserMode"
 					:charges="currentCharges ?? 0"
 					:max-charges="maxCharges ?? 0"
-					:pixel-count="pixels.length"
+					:pixel-count="pendingPixelCount"
 					:time-until-next="formattedTime"
 					:extra-colors-bitmap="userProfile?.extraColorsBitmap ?? 0"
 					@close="handleClosePaint"
 					@submit="handleSubmitPixels"
 					@select-color="handleSelectColor"
+					@purchase-color="handlePurchaseColor"
 					@toggle-eraser="isEraserMode = !isEraserMode"
 				/>
 			</div>
@@ -176,9 +181,9 @@
 					@go-to-random="goToRandom"
 				/>
 			</div>
-	</div>
+		</div>
 
-	<PixelInfo
+		<PixelInfo
 			:is-open="selectedPixelCoords !== null"
 			:coords="selectedPixelCoords"
 			@close="selectedPixelCoords = null"
@@ -193,6 +198,7 @@
 		/>
 
 		<StoreDialog
+			ref="storeDialog"
 			:is-open="isStoreOpen"
 			:user-profile="userProfile"
 			@close="isStoreOpen = false"
@@ -211,14 +217,14 @@
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import Toast from "primevue/toast";
 import OverlayBadge from "primevue/overlaybadge";
-import Map, { type LocationWithZoom } from "~/components/Map.vue";
+import MapComponent, { type LocationWithZoom } from "~/components/Map.vue";
 import PaintButton from "~/components/PaintButton.vue";
 import ColorPalette from "~/components/ColorPalette.vue";
 import UserAvatar from "~/components/UserAvatar.vue";
 import UserMenu from "~/components/UserMenu.vue";
 import PixelInfo from "~/components/PixelInfo.vue";
 import NotificationDialog from "~/components/NotificationDialog.vue";
-import StoreDialog from "~/components/StoreDialog.vue";
+import StoreDialog, { StoreTab } from "~/components/StoreDialog.vue";
 import { CLOSE_ZOOM_LEVEL, getPixelId, type LngLat, lngLatToTileCoords, type TileCoords, tileCoordsToLngLat, WIDE_ZOOM_LEVEL, ZOOM_LEVEL } from "~/utils/coordinates";
 import { type UserProfile, useUserProfile } from "~/composables/useUserProfile";
 import { useCharges } from "~/composables/useCharges";
@@ -226,6 +232,7 @@ import { usePaint } from "~/composables/usePaint";
 import { useErrorToast } from "~/composables/useErrorToast";
 import { useNotifications } from "~/composables/useNotifications";
 import { useTheme } from "~/composables/useTheme";
+import { useViewport } from "~/composables/useViewport";
 import SearchBox from "~/components/SearchBox.vue";
 import { DEFAULT_LOCATIONS } from "~/utils/default-locations";
 
@@ -254,8 +261,9 @@ const selectedPixelCoords = ref<TileCoords | null>(null);
 const userProfile = ref<UserProfile | null>(null);
 const isLoading = ref(true);
 const userMenuRef = ref();
-const mapRef = ref();
-const searchBoxRef = ref();
+const mapRef = ref<typeof MapComponent>();
+const storeDialog = ref<typeof StoreDialog>();
+const searchBoxRef = ref<typeof SearchBox>();
 const mapBearing = ref(0);
 const randomTargetCoords = ref<{ lat: number; lng: number; zoom: number } | null>(null);
 
@@ -276,6 +284,7 @@ const { submitPixels } = usePaint();
 const { showToast, handleError } = useErrorToast();
 const { getUnreadCount } = useNotifications();
 const { initTheme } = useTheme();
+const { isMobile } = useViewport();
 
 const isLoggedIn = computed(() => userProfile.value !== null);
 
@@ -328,8 +337,8 @@ const initialLocation = computed((): LocationWithZoom => {
 const saveCurrentLocation = () => {
 	try {
 		localStorage["location"] = JSON.stringify({
-			...mapRef.value.getCenter(),
-			zoom: mapRef.value.getZoom()
+			...mapRef.value?.getCenter(),
+			zoom: mapRef.value?.getZoom()
 		});
 	} catch {
 		// Ignore?
@@ -497,6 +506,11 @@ const handleSelectColor = (index: number, color: string) => {
 	selectedColor.value = color;
 	isEraserMode.value = false;
 	localStorage["selected-color"] = `${index}`;
+};
+
+const handlePurchaseColor = () => {
+	storeDialog.value?.selectTab(StoreTab.Colors);
+	isStoreOpen.value = true;
 };
 
 const handleSubmitPixels = async () => {
@@ -675,19 +689,13 @@ const handleReportPixel = () => {
 };
 
 const handleFavoriteChanged = async () => {
-	try {
-		lastUserProfileFetch = Date.now();
-		userProfile.value = await fetchUserProfile();
-	} catch (error) {
-		console.error("Failed to refresh user profile:", error);
-		handleError(error);
-	}
+	await updateUserProfile();
 };
 
 const handleFavoriteClick = (favorite: { id: number; name: string; latitude: number; longitude: number }) => {
 	// Center on favorite
-	const zoom = Math.max(mapRef.value.getZoom(), CLOSE_ZOOM_LEVEL);
-	mapRef.value.flyToLocation(favorite.latitude, favorite.longitude, zoom);
+	const zoom = Math.max(mapRef.value?.getZoom(), CLOSE_ZOOM_LEVEL);
+	mapRef.value?.flyToLocation(favorite.latitude, favorite.longitude, zoom);
 	pushMapLocation([favorite.longitude, favorite.latitude], zoom);
 
 	// Open pixel info
@@ -696,13 +704,7 @@ const handleFavoriteClick = (favorite: { id: number; name: string; latitude: num
 };
 
 const handleStoreRefresh = async () => {
-	try {
-		lastUserProfileFetch = Date.now();
-		userProfile.value = await fetchUserProfile();
-	} catch (error) {
-		console.error("Failed to refresh user profile:", error);
-		handleError(error);
-	}
+	await updateUserProfile();
 };
 
 const zoomIn = () => mapRef.value?.zoomIn();
@@ -756,9 +758,15 @@ const handleSearchSelect = (bbox: [number, number, number, number]) => {
 
 <style scoped>
 .app-container {
+	--padding: 1rem;
+	--spacer: 0.75rem;
 	width: 100vw;
 	height: 100dvh;
 	overflow: hidden;
+}
+
+.app-container.app-container--mobile {
+	--padding: 0.75rem;
 }
 
 .map-loading {
@@ -791,9 +799,9 @@ const handleSearchSelect = (bbox: [number, number, number, number]) => {
 	display: flex;
 	flex-direction: column;
 	align-items: flex-start;
-	gap: 0.75rem;
+	gap: var(--spacer);
 	grid-area: top-left;
-	padding: 1rem;
+	padding: var(--padding);
 }
 
 .app-overlays-profile {
@@ -803,9 +811,9 @@ const handleSearchSelect = (bbox: [number, number, number, number]) => {
 	justify-content: flex-end;
 	align-self: end;
 	justify-self: end;
-	gap: 0.75rem;
+	gap: var(--spacer);
 	grid-area: top-right;
-	padding: 1rem;
+	padding: var(--padding);
 }
 
 .app-overlays-paint {
@@ -814,7 +822,7 @@ const handleSearchSelect = (bbox: [number, number, number, number]) => {
 	justify-self: center;
 	position: relative;
 	z-index: 11;
-	padding-bottom: 1rem;
+	padding-bottom: var(--padding);
 }
 
 .app-overlays-palette {

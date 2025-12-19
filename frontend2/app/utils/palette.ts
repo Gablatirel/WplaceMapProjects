@@ -1,6 +1,8 @@
+export const PAID_PALETTE_INDEX = 32;
+
 type RGBA = [number, number, number, number];
 
-interface PaletteColor {
+export interface PaletteColor {
 	name: string;
 	index: number;
 	rgba: RGBA;
@@ -329,7 +331,7 @@ export const palette: PaletteColor[] = [
 	}
 ];
 
-const freePalette = palette.filter(({ index }) => index < 32);
+const freePalette = palette.filter(({ index }) => index < PAID_PALETTE_INDEX);
 const transparentColor = palette.find(item => item.index === 0)!;
 
 // Find the closest palette color to an arbitrary color
@@ -369,7 +371,7 @@ export function getClosestColor(color: RGBA, usePaidColors = false): PaletteColo
 
 // Check if a color is unlocked for the user
 export function isColorUnlocked(colorIndex: number, extraColorsBitmap: number): boolean {
-	if (colorIndex < 32) {
+	if (colorIndex < PAID_PALETTE_INDEX) {
 		return true;
 	}
 

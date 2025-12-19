@@ -1,11 +1,53 @@
 <template>
-	<div
-		v-if="isOpen"
-		class="palette-container"
+	<Dialog
+		:draggable="false"
+		:visible="isOpen"
+		:style="{
+			width: '100%',
+			margin: '0',
+			borderRadius: isBottom
+				? 'var(--p-dialog-border-radius) var(--p-dialog-border-radius) 0 0'
+				: '0 0 var(--p-dialog-border-radius) var(--p-dialog-border-radius)'
+		}"
+		:position="isBottom ? 'bottom' : 'top'"
 	>
-		<Card class="palette-card" aria-labelledby="palette-label">
-			<template #header>
+		<template #container>
+			<div
+				:class="[
+					'palette-card',
+					isMobile ? 'palette-card--mobile' : null
+				]"
+				aria-labelledby="palette-label"
+			>
 				<div class="palette-header">
+					<div class="palette-buttons">
+						<Button
+							v-tooltip.top="isExpanded ? 'Show free colors' : 'Show all colors'"
+							severity="secondary"
+							icon="_"
+							size="small"
+							rounded
+							outlined
+							:aria-label="isExpanded ? 'Show free colors' : 'Show all colors'"
+							@click="isExpanded = !isExpanded"
+						>
+							<Icon :name="isExpanded ? 'zoom_out' : 'zoom_in'" />
+						</Button>
+
+						<Button
+							v-tooltip.top="isBottom ? 'Move to top' : 'Move to bottom'"
+							severity="secondary"
+							icon="_"
+							size="small"
+							rounded
+							outlined
+							:aria-label="isBottom ? 'Move to top' : 'Move to bottom'"
+							@click="isBottom = !isBottom"
+						>
+							<Icon :name="isBottom ? 'arrow_up' : 'arrow_down'" />
+						</Button>
+					</div>
+
 					<Icon name="paint" class="palette-header-icon" />
 
 					<h3 id="palette-label" class="palette-header-label">
@@ -16,6 +58,7 @@
 						<Button
 							v-tooltip.top="isEraserMode ? 'Switch to painting' : 'Switch to eraser'"
 							:severity="isEraserMode ? 'danger' : 'secondary'"
+							icon="_"
 							size="small"
 							rounded
 							:outlined="!isEraserMode"
@@ -28,6 +71,7 @@
 						<Button
 							v-tooltip.top="pixelCount === 0 ? 'Close' : 'Discard changes'"
 							:severity="pixelCount === 0 ? 'secondary' : 'danger'"
+							icon="_"
 							size="small"
 							rounded
 							text
@@ -38,30 +82,37 @@
 						</Button>
 					</div>
 				</div>
-			</template>
 
-			<template #content>
 				<div class="palette-body">
 					<div class="color-grid">
 						<Button
-							v-for="item in palette"
+							v-for="item in paletteItems"
 							:key="item.index"
 							v-tooltip.top="item.name"
 							:class="['color-button', {
 								'color-button--transparent': item.rgba[3] === 0,
-								'color-button--selected': selectedColor === `rgba(${item.rgba.join(',')})`
+								'color-button--selected': selectedColor === item.cssValue,
+								'color-button--locked': !item.isUnlocked
 							}]"
-							:style="{ backgroundColor: `rgba(${item.rgba.join(',')})` }"
-							:raised="selectedColor === `rgba(${item.rgba.join(',')})`"
-							:disabled="!isColorUnlocked(item.index, extraColorsBitmap)"
-							:aria-label="isColorUnlocked(item.index, extraColorsBitmap) ? 'Select color' : 'Color locked'"
-							@click="$emit('selectColor', item.index, `rgba(${item.rgba.join(',')})`)">
-							<span/>
+							:raised="selectedColor === item.cssValue"
+							:aria-label="`${item.isUnlocked ? 'Select color' : 'Purchase color'}: ${item.name}`"
+							@click="handleSelectColor(item)">
+							<div
+								class="color-button-color"
+								:style="{ backgroundColor: item.cssValue }"
+							/>
+
+							<Icon
+								v-if="!item.isUnlocked"
+								name="lock"
+								class="color-button-lock"
+							/>
 						</Button>
 					</div>
 
 					<PaintButton
 						class="palette-paint-button"
+						:size="isMobile ? 'normal' : 'large'"
 						:charges="charges"
 						:max-charges="maxCharges"
 						:time-until-next="timeUntilNext"
@@ -70,17 +121,18 @@
 						@click="$emit('submit')"
 					/>
 				</div>
-			</template>
-		</Card>
-	</div>
+			</div>
+		</template>
+	</Dialog>
 </template>
 
 <script setup lang="ts">
-import { isColorUnlocked, palette } from "~/utils/palette";
-import Card from "primevue/card";
+import { isColorUnlocked, PAID_PALETTE_INDEX, palette, type PaletteColor } from "~/utils/palette";
+import Dialog from "primevue/dialog";
 import Button from "primevue/button";
+import { useViewport } from "~/composables/useViewport";
 
-defineProps<{
+const props = defineProps<{
 	isOpen: boolean;
 	selectedColor: string;
 	isEraserMode: boolean;
@@ -91,12 +143,51 @@ defineProps<{
 	extraColorsBitmap: number;
 }>();
 
-defineEmits<{
+const emit = defineEmits<{
 	close: [];
 	submit: [];
-	selectColor: [index: number, color: string];
+	selectColor: [index: number, cssValue: string];
+	purchaseColor: [];
 	toggleEraser: [];
 }>();
+
+interface PaletteItem extends PaletteColor {
+	cssValue: string;
+	isUnlocked: boolean;
+}
+
+const paletteItems = computed(() => palette
+	.filter(item => isExpanded.value || item.index < PAID_PALETTE_INDEX)
+	.map((item): PaletteItem => ({
+		...item,
+		cssValue: `rgba(${item.rgba.join(",")})`,
+		isUnlocked: isColorUnlocked(item.index, props.extraColorsBitmap)
+	})));
+
+const { isMobile } = useViewport();
+
+const isExpanded = ref(false);
+const isBottom = ref(true);
+
+onMounted(() => {
+	try {
+		isExpanded.value = localStorage["show-all-colors"] === "true";
+	} catch {
+		// Ignore
+	}
+});
+
+watch(() => isExpanded, () => {
+	localStorage["show-all-colors"] = isExpanded.value ? "true" : "false";
+});
+
+const handleSelectColor = (item: PaletteItem) => {
+	if (item.isUnlocked) {
+		emit("selectColor", item.index, item.cssValue);
+	} else {
+		emit("purchaseColor");
+	}
+};
 </script>
 
 <style scoped>
@@ -104,17 +195,22 @@ defineEmits<{
 	width: 100%;
 }
 
+.palette-card--mobile {
+	--p-card-body-padding: 0.75rem;
+}
+
 .palette-header {
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
-	padding: 0.75rem var(--p-card-body-padding) 0 var(--p-card-body-padding);
+	padding: calc(var(--p-card-body-padding) * 0.8) var(--p-card-body-padding) calc(var(--p-card-body-padding) * 0.2) var(--p-card-body-padding);
 	gap: 0.25rem;
 	border-bottom: 1px solid var(--p-surface-border);
 }
 
 .palette-header-icon {
 	font-size: 1.5rem;
+	margin-inline-start: 0.25rem;
 }
 
 .palette-header-label {
@@ -139,8 +235,9 @@ defineEmits<{
 .palette-body {
 	display: flex;
 	flex-direction: column;
-	gap: 1rem;
-	margin: -0.5rem 0 -0.25rem 0;
+	gap: calc(var(--p-card-body-padding) * 0.8);
+	margin: calc(var(--p-card-body-padding) * 0.6) calc(var(--p-card-body-padding) * 0.8);
+	margin-bottom: calc((var(--p-card-body-padding) * 0.8) - 1px);
 }
 
 .color-grid {
@@ -166,12 +263,40 @@ defineEmits<{
 }
 
 .color-button {
+	--border-color: var(--p-gray-300);
+	--foreground-color: var(--p-gray-500);
+	position: relative;
 	min-width: 30px;
 	min-height: 30px;
 	padding: 0;
-	min-width: 30px;
-	border: 1px solid var(--p-button-outlined-secondary-border-color);
+	border: 1px solid var(--border-color);
 	border-radius: 6px;
+}
+
+.app-dark .color-button {
+	--border-color: var(--p-gray-600);
+	--foreground-color: var(--p-gray-400);
+}
+
+.color-button,
+.color-button:hover,
+.color-button:active {
+	background: none;
+}
+
+.color-button-color {
+	position: absolute;
+	inset: 0;
+}
+
+.color-button-lock {
+	position: relative;
+	width: 1.5em;
+	height: 1.5em;
+	background: color-mix(in srgb, var(--p-dialog-background), transparent 50%);
+	border: 1px solid color-mix(in srgb, var(--border-color), transparent 50%);
+	border-radius: 100%;
+	color: var(--foreground-color);
 }
 
 @media (min-height: 700px) {
@@ -190,21 +315,8 @@ defineEmits<{
 	border: 3px solid var(--p-primary-color);
 }
 
-.color-button:disabled {
-	opacity: 0.3;
-	cursor: not-allowed;
-	position: relative;
-}
-
-/* TODO: Make this nicer */
-.color-button:disabled::after {
-	content: "🔒";
-	position: absolute;
-	top: 50%;
-	left: 50%;
-	transform: translate(-50%, -50%);
-	font-size: 12px;
-	filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.8));
+.color-button--locked .color-button-color {
+	opacity: 0.9;
 }
 
 .color-button--transparent::before {
