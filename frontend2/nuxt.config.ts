@@ -90,6 +90,21 @@ export default defineNuxtConfig({
 					name: "og:description",
 					property: "og:description",
 					content: "openplace is a free unofficial open source backend for wplace."
+				},
+				{
+					name: "theme-color",
+					content: "#f9f4f0",
+					media: "(prefers-color-scheme: light)"
+				},
+				{
+					name: "theme-color",
+					content: "#38435c",
+					media: "(prefers-color-scheme: dark)"
+				},
+				{
+					name: "theme-color",
+					content: "#4169e1",
+					media: "only _" // Used by Discord
 				}
 			],
 
