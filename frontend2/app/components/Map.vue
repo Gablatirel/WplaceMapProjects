@@ -19,7 +19,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import type { Map as MaplibreMap, Marker, RasterTileSource, StyleSpecification } from "maplibre-gl";
+import type { CanvasSource, GeoJSONSource, Map as MaplibreMap, Marker, RasterTileSource, StyleSpecification } from "maplibre-gl";
 import { getPixelBounds, getPixelsBetween, getTileBounds, type LngLat, lngLatToTileCoords, TILE_SIZE, type TileCoords, ZOOM_LEVEL } from "~/utils/coordinates";
 import { useTheme } from "~/composables/useTheme";
 
@@ -35,9 +35,8 @@ export interface LocationWithZoom {
 	zoom: number;
 }
 
-interface Pixel {
-	id: string;
-	tileCoords: TileCoords;
+export interface Pixel {
+	coords: TileCoords;
 	color: string;
 }
 
@@ -59,22 +58,33 @@ export interface FavoriteLocation {
 
 const props = defineProps<{
 	initialLocation: LocationWithZoom;
-	pixels: Pixel[];
 	isDrawing: boolean;
 	isSatellite: boolean;
 	favoriteLocations?: FavoriteLocation[];
 	selectedPixelCoords?: TileCoords | null;
+	selectedColor?: string;
+	isEraserMode?: boolean;
+	currentCharges?: number | null;
 }>();
 
 const emit = defineEmits<{
 	mapClick: [event: LngLat];
 	mapRightClick: [event: LngLat];
 	mapHover: [event: LngLat];
-	drawPixels: [coords: TileCoords[]];
 	bearingChange: [bearing: number];
 	favoriteClick: [favorite: FavoriteLocation];
 	saveCurrentLocation: [];
+	pixelCountChange: [count: number];
+	pixelsReady: [pixels: Array<{ coords: TileCoords; color: string }>];
 }>();
+
+const TILE_PATH = "/files/s0/tiles/{x}/{y}.png";
+// https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}.jpeg
+const SATELLITE_TILE_PATH = "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}";
+
+const FAVORITE_STAR_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24"><path fill="#ffb300" d="m6.128 21 1.548-6.65-5.181-4.484 6.835-.587L11.995 3l2.675 6.279 6.835.587-5.181 4.484L17.872 21l-5.877-3.533z"/></svg>`;
+
+const CANVAS_PIXEL_SIZE = 100;
 
 const TILE_RELOAD_INTERVAL = 15_000;
 const LOCATION_SAVE_INTERVAL = 5000;
@@ -97,7 +107,20 @@ let tileReloadInterval: ReturnType<typeof setInterval> | null = null;
 let activityTimeout: ReturnType<typeof setTimeout> | null = null;
 let lastTileRefreshTime = 0;
 
-const tileCanvases = new Map<string, TileCanvas>();
+type PendingPixelCanvasKey = `${number},${number},${number},${number}`;
+type PixelCoordsKey = `${number},${number}`;
+
+interface PendingPixelCanvas {
+	canvas: HTMLCanvasElement;
+	ctx: CanvasRenderingContext2D;
+	sourceId: string;
+	layerId: string;
+	pixelData: Map<PixelCoordsKey, Pixel>;
+}
+
+const tileCanvases = new Map<PixelCoordsKey, TileCanvas>();
+const pendingPixelCanvases = new Map<PendingPixelCanvasKey, PendingPixelCanvas>();
+const pendingPixelCount = ref(0);
 
 const { isDarkMode } = useTheme();
 
@@ -111,8 +134,202 @@ watch(() => mapStyle.value, () => {
 	}
 });
 
+const getCanvasKey = ({ tile, pixel }: TileCoords): PendingPixelCanvasKey => {
+	const [x, y] = [
+		Math.floor(pixel[0] / CANVAS_PIXEL_SIZE) * CANVAS_PIXEL_SIZE,
+		Math.floor(pixel[1] / CANVAS_PIXEL_SIZE) * CANVAS_PIXEL_SIZE
+	];
+	return `${tile[0]},${tile[1]},${x},${y}`;
+};
+
+const getPixelInCanvasCoords = (pixelCoord: number): number => pixelCoord % CANVAS_PIXEL_SIZE;
+
+const getPendingPixelCanvas = (coords: TileCoords) => {
+	const key = getCanvasKey(coords);
+	let canvasData = pendingPixelCanvases.get(key);
+	if (!canvasData) {
+		const canvas = document.createElement("canvas");
+		canvas.width = CANVAS_PIXEL_SIZE;
+		canvas.height = CANVAS_PIXEL_SIZE;
+
+		const ctx = canvas.getContext("2d", {
+			willReadFrequently: true
+		})!;
+		ctx.imageSmoothingEnabled = false;
+
+		const sourceId = `openplace-pending-pixels-canvas-${key}`;
+		const layerId = `openplace-pending-pixels-canvas-layer-${key}`;
+
+		canvasData = {
+			canvas,
+			ctx,
+			sourceId,
+			layerId,
+			pixelData: new Map()
+		};
+
+		pendingPixelCanvases.set(key, canvasData);
+
+		if (map) {
+			const [tileX, tileY] = coords.tile;
+			const [x, y] = coords.pixel;
+			const [basePixelX, basePixelY] = [
+				Math.floor(x / CANVAS_PIXEL_SIZE) * CANVAS_PIXEL_SIZE,
+				Math.floor(y / CANVAS_PIXEL_SIZE) * CANVAS_PIXEL_SIZE
+			];
+
+			const topLeftBounds = getPixelBounds({
+				tile: [tileX, tileY],
+				pixel: [basePixelX, basePixelY]
+			});
+			const topRightBounds = getPixelBounds({
+				tile: [tileX, tileY],
+				pixel: [basePixelX + CANVAS_PIXEL_SIZE - 1, basePixelY]
+			});
+			const bottomRightBounds = getPixelBounds({
+				tile: [tileX, tileY],
+				pixel: [basePixelX + CANVAS_PIXEL_SIZE - 1, basePixelY + CANVAS_PIXEL_SIZE - 1]
+			});
+			const bottomLeftBounds = getPixelBounds({
+				tile: [tileX, tileY],
+				pixel: [basePixelX, basePixelY + CANVAS_PIXEL_SIZE - 1]
+			});
+
+			const scaledBounds: [LngLat, LngLat, LngLat, LngLat] = [
+				topLeftBounds.topLeft,
+				topRightBounds.topRight,
+				bottomRightBounds.bottomRight,
+				bottomLeftBounds.bottomLeft
+			];
+
+			if (!map.getSource(sourceId)) {
+				map.addSource(sourceId, {
+					type: "canvas",
+					canvas,
+					coordinates: [scaledBounds[0], scaledBounds[1], scaledBounds[2], scaledBounds[3]],
+					animate: false
+				});
+			}
+
+			if (!map.getLayer(layerId)) {
+				map.addLayer({
+					id: layerId,
+					type: "raster",
+					source: sourceId,
+					paint: {
+						"raster-opacity": 1,
+						"raster-resampling": "nearest"
+					}
+				});
+
+				// TODO: Why is the border layer falling underneath the pixel layers?
+				map.moveLayer("openplace-pending-pixels-border");
+			}
+		}
+	}
+
+	return canvasData;
+};
+
+const getPendingPixel = (coords: TileCoords): Pixel | undefined =>
+	getPendingPixelCanvas(coords)?.pixelData
+		.get(`${coords.pixel[0]},${coords.pixel[1]}`);
+
+const updatePendingPixelBorders = () => {
+	const source = map?.getSource("openplace-pending-pixels-border") as GeoJSONSource;
+	if (!source) {
+		return;
+	}
+
+	const features = [];
+	for (const canvasData of pendingPixelCanvases.values()) {
+		for (const pixel of canvasData.pixelData.values()) {
+			const bounds = getPixelBounds(pixel.coords);
+			features.push({
+				type: "Feature" as const,
+				geometry: {
+					type: "Polygon" as const,
+					coordinates: [
+						[
+							bounds.topLeft,
+							bounds.topRight,
+							bounds.bottomRight,
+							bounds.bottomLeft,
+							bounds.topLeft
+						]
+					]
+				},
+				properties: {}
+			});
+		}
+	}
+
+	source.setData({
+		type: "FeatureCollection" as const,
+		features
+	});
+};
+
+const drawPixelOnPendingCanvas = (coords: TileCoords, color: string | null) => {
+	if (getPendingPixel(coords)?.color === color) {
+		return;
+	}
+
+	const canvasData = getPendingPixelCanvas(coords);
+	const [x, y] = coords.pixel;
+	const [canvasX, canvasY] = [
+		getPixelInCanvasCoords(coords.pixel[0]),
+		getPixelInCanvasCoords(coords.pixel[1])
+	];
+
+	if (color) {
+		// Draw on pending canvas
+		canvasData.ctx.fillStyle = color;
+		canvasData.ctx.fillRect(canvasX, canvasY, 1, 1);
+
+		// Store it
+		canvasData.pixelData.set(`${x},${y}`, { coords, color });
+		pendingPixelCount.value += 1;
+	} else {
+		// Clear from pending canvas
+		canvasData.ctx.clearRect(canvasX, canvasY, 1, 1);
+
+		// Clear from data
+		canvasData.pixelData.delete(`${x},${y}`);
+		pendingPixelCount.value -= 1;
+	}
+
+	// Trigger canvas redraw
+	const source = map?.getSource(canvasData.sourceId) as CanvasSource;
+	source?.play();
+
+	updatePendingPixelBorders();
+
+	emit("pixelCountChange", pendingPixelCount.value);
+};
+
+const erasePendingPixel = (coords: TileCoords) => {
+	const canvasData = getPendingPixelCanvas(coords);
+	// const [x, y] = coords.pixel;
+	const [canvasX, canvasY] = [
+		getPixelInCanvasCoords(coords.pixel[0]),
+		getPixelInCanvasCoords(coords.pixel[1])
+	];
+
+	// Clear from pending canvas
+	canvasData.ctx.clearRect(canvasX, canvasY, 1, 1);
+
+	// Trigger canvas redraw
+	const source = map?.getSource(canvasData.sourceId) as CanvasSource;
+	source?.play();
+
+	updatePendingPixelBorders();
+
+	emit("pixelCountChange", pendingPixelCount.value);
+};
+
 const getTileCanvas = (tileX: number, tileY: number): TileCanvas => {
-	const key = `${tileX}-${tileY}`;
+	const key: PixelCoordsKey = `${tileX},${tileY}`;
 	if (tileCanvases.has(key)) {
 		return tileCanvases.get(key)!;
 	}
@@ -161,19 +378,26 @@ const getTileCanvas = (tileX: number, tileY: number): TileCanvas => {
 					"raster-opacity": 1,
 					"raster-resampling": currentZoom.value >= ZOOM_LEVEL ? "nearest" : "linear"
 				}
-			}, "openplace-pending-pixels-border");
+			});
+
+			// Move border layer to top so it renders above all canvas layers
+			if (map.getLayer("openplace-pending-pixels-border")) {
+				map.moveLayer("openplace-pending-pixels-border");
+			}
 		}
 	}
 
 	return tileCanvas;
 };
 
-const drawPixelOnCanvas = (coords: TileCoords, color: string) => {
+const drawPixelOnCanvas = (coords: TileCoords, color: string | null) => {
+	drawPixelOnPendingCanvas(coords, color);
+
 	const [tileX, tileY] = coords.tile;
 	const [x, y] = coords.pixel;
 
 	const tileCanvas = getTileCanvas(tileX, tileY);
-	const { ctx, sourceId } = tileCanvas;
+	const { ctx } = tileCanvas;
 
 	if (color === "rgba(0,0,0,0)") {
 		// Drawing transparency - clear the pixel underneath
@@ -184,45 +408,38 @@ const drawPixelOnCanvas = (coords: TileCoords, color: string) => {
 	}
 
 	tileCanvas.isDirty = true;
-
-	// Trigger maplibre re-render of this source
-	const source = map!.getSource(sourceId);
-	if (source && "play" in source && typeof source.play === "function") {
-		source.play();
-		map!.triggerRepaint();
-		setTimeout(() => {
-			if ("pause" in source && typeof source.pause === "function") {
-				source.pause();
-			}
-		}, 0);
-	}
 };
 
 const cancelPaint = () => {
+	for (const canvasData of pendingPixelCanvases.values()) {
+		if (map?.getLayer(canvasData.layerId)) {
+			map.removeLayer(canvasData.layerId);
+		}
+		if (map?.getSource(canvasData.sourceId)) {
+			map.removeSource(canvasData.sourceId);
+		}
+	}
+	pendingPixelCanvases.clear();
+	pendingPixelCount.value = 0;
+	emit("pixelCountChange", 0);
+
+	updatePendingPixelBorders();
+
+	// Reset tile canvases
 	for (const tileCanvas of tileCanvases.values()) {
 		if (tileCanvas.originalImageData) {
 			tileCanvas.ctx.putImageData(tileCanvas.originalImageData, 0, 0);
 			tileCanvas.isDirty = false;
 
 			// Trigger update
-			if (map && map.getSource(tileCanvas.sourceId)) {
-				const source = map.getSource(tileCanvas.sourceId);
-				if (source && "play" in source && typeof source.play === "function") {
-					source.play();
-					map?.triggerRepaint();
-					setTimeout(() => {
-						if ("pause" in source && typeof source.pause === "function") {
-							source.pause();
-						}
-					}, 0);
-				}
-			}
+			const source = map?.getSource(tileCanvas.sourceId) as CanvasSource;
+			source?.play();
 		}
 	}
 };
 
-// Make changes drawn by the user permanent, after submitting paint to server
 const commitCanvases = () => {
+	// Make changes drawn by the user permanent, after submitting paint to server
 	for (const tileCanvas of tileCanvases.values()) {
 		if (tileCanvas.isDirty) {
 			tileCanvas.originalImageData = tileCanvas.ctx.getImageData(0, 0, TILE_SIZE, TILE_SIZE);
@@ -230,6 +447,37 @@ const commitCanvases = () => {
 		}
 	}
 };
+
+const clearPendingCanvases = () => {
+	for (const canvasData of pendingPixelCanvases.values()) {
+		if (map?.getLayer(canvasData.layerId)) {
+			map.removeLayer(canvasData.layerId);
+		}
+		if (map?.getSource(canvasData.sourceId)) {
+			map.removeSource(canvasData.sourceId);
+		}
+
+		canvasData.ctx.clearRect(0, 0, canvasData.canvas.width, canvasData.canvas.height);
+		canvasData.pixelData.clear();
+	}
+
+	pendingPixelCanvases.clear();
+	pendingPixelCount.value = 0;
+	emit("pixelCountChange", 0);
+
+	updatePendingPixelBorders();
+};
+
+const getAllPendingPixels = (): Pixel[] => {
+	const result: Pixel[] = [];
+	for (const canvasData of pendingPixelCanvases.values()) {
+		for (const pixel of canvasData.pixelData.values()) {
+			result.push(pixel);
+		}
+	}
+	return result;
+};
+
 
 const removeAllCanvases = () => {
 	for (const tileCanvas of tileCanvases.values()) {
@@ -244,6 +492,7 @@ const removeAllCanvases = () => {
 };
 
 const setUpMapLayers = (mapInstance: MaplibreMap, savedZoom?: number) => {
+	// @ts-expect-error - This makes TypeScript mad
 	mapInstance.setStyle(mapStyle.value, {
 		diff: true,
 		transformStyle: (previousStyle, nextStyle) => ({
@@ -274,10 +523,7 @@ const setUpMapLayers = (mapInstance: MaplibreMap, savedZoom?: number) => {
 	if (!mapInstance.getSource("openplace-satellite")) {
 		mapInstance.addSource("openplace-satellite", {
 			type: "raster",
-			tiles: [
-				// "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}.jpeg"
-				"https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"
-			],
+			tiles: [SATELLITE_TILE_PATH],
 			tileSize: 256
 		});
 	}
@@ -323,24 +569,13 @@ const setUpMapLayers = (mapInstance: MaplibreMap, savedZoom?: number) => {
 		});
 	}
 
-	if (!mapInstance.getSource("openplace-pixels")) {
-		mapInstance.addSource("openplace-pixels", {
-			type: "geojson",
-			data: pixelGeoJSON.value
-		});
-	}
-
 	if (!mapInstance.getSource("openplace-pending-pixels-border")) {
 		mapInstance.addSource("openplace-pending-pixels-border", {
 			type: "geojson",
-			data: pendingPixelBordersGeoJSON.value
-		});
-	}
-
-	if (!mapInstance.getSource("openplace-hover")) {
-		mapInstance.addSource("openplace-hover", {
-			type: "geojson",
-			data: hoverGeoJSON.value
+			data: {
+				type: "FeatureCollection",
+				features: []
+			}
 		});
 	}
 
@@ -353,6 +588,16 @@ const setUpMapLayers = (mapInstance: MaplibreMap, savedZoom?: number) => {
 				"line-color": "#fff",
 				"line-width": 4,
 				"line-opacity": 0.5
+			}
+		});
+	}
+
+	if (!mapInstance.getSource("openplace-hover")) {
+		mapInstance.addSource("openplace-hover", {
+			type: "geojson",
+			data: {
+				type: "FeatureCollection",
+				features: []
 			}
 		});
 	}
@@ -371,68 +616,16 @@ const setUpMapLayers = (mapInstance: MaplibreMap, savedZoom?: number) => {
 	}
 };
 
-const pixelGeoJSON = computed(() => ({
-	type: "FeatureCollection" as const,
-	features: props.pixels.map(pixel => {
-		const bounds = getPixelBounds(pixel.tileCoords);
-		return {
-			type: "Feature" as const,
-			geometry: {
-				type: "Polygon" as const,
-				coordinates: [
-					[
-						bounds.topLeft,
-						bounds.topRight,
-						bounds.bottomRight,
-						bounds.bottomLeft,
-						bounds.topLeft
-					]
-				]
-			},
-			properties: {
-				id: pixel.id,
-				color: pixel.color
-			}
-		};
-	})
-}));
-
-const pendingPixelBordersGeoJSON = computed(() => ({
-	type: "FeatureCollection" as const,
-	features: props.pixels.map(pixel => {
-		const bounds = getPixelBounds(pixel.tileCoords, 0.015);
-		return {
-			type: "Feature" as const,
-			geometry: {
-				type: "Polygon" as const,
-				coordinates: [
-					[
-						bounds.topLeft,
-						bounds.topRight,
-						bounds.bottomRight,
-						bounds.bottomLeft,
-						bounds.topLeft
-					]
-				]
-			},
-			properties: {
-				id: pixel.id
-			}
-		};
-	})
-}));
-
-const hoverGeoJSON = computed(() => {
+const updateHoverGeoJSON = () => {
 	const coords = props.selectedPixelCoords ?? hoverCoords.value;
-	if (!coords) {
-		return {
-			type: "FeatureCollection" as const,
-			features: []
-		};
+	const source = map?.getSource("openplace-hover") as GeoJSONSource;
+
+	if (!source || !coords) {
+		return;
 	}
 
 	const bounds = getPixelBounds(coords);
-	return {
+	source.setData({
 		type: "FeatureCollection" as const,
 		features: [
 			{
@@ -452,8 +645,8 @@ const hoverGeoJSON = computed(() => {
 				properties: {}
 			}
 		]
-	};
-});
+	});
+};
 
 const updateFavoriteMarkers = async () => {
 	if (!map) {
@@ -473,7 +666,7 @@ const updateFavoriteMarkers = async () => {
 		// TODO: Tidy this up
 		const star = document.createElement("button");
 		star.className = "favorite-marker";
-		star.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24"><path fill="#ffb300" d="m6.128 21 1.548-6.65-5.181-4.484 6.835-.587L11.995 3l2.675 6.279 6.835.587-5.181 4.484L17.872 21l-5.877-3.533z"/></svg>`;
+		star.innerHTML = FAVORITE_STAR_SVG;
 		star.title = "Click to visit favorite location";
 		star.setAttribute("aria-label", "Favorite location");
 		star.addEventListener("click", e => {
@@ -496,8 +689,7 @@ const refreshTiles = () => {
 		if (source) {
 			try {
 				// Force maplibre to fetch again by using a fragment
-				// source.setTiles([`${config.public.backendUrl}/files/s0/tiles/{z}/{x}/{y}.png#${Date.now()}`]);
-				source.setTiles([`${config.public.backendUrl}/files/s0/tiles/{x}/{y}.png#${Date.now()}`]);
+				source.setTiles([`${config.public.backendUrl}${TILE_PATH}#${Date.now()}`]);
 			} catch {
 				// Can throw AbortError, ignore
 			}
@@ -577,6 +769,7 @@ onMounted(async () => {
 	});
 
 	// Expose map on window
+	// @ts-expect-error - idk why this type doesn’t work
 	globalThis.map = map;
 
 	// Gestures
@@ -651,10 +844,18 @@ onMounted(async () => {
 		hoverCoords.value = coords;
 
 		if (props.isDrawing && isDrawingActive.value && lastDrawnCoords.value) {
-			const pixelsToDraw = getPixelsBetween(lastDrawnCoords.value, coords);
-			if (pixelsToDraw.length > 0) {
-				emit("drawPixels", pixelsToDraw);
-				lastDrawnCoords.value = coords;
+			if (props.currentCharges ?? 0 <= 0) {
+				// TODO: Needed?
+				isDrawingActive.value = false;
+			} else {
+				const pixelsToDraw = getPixelsBetween(lastDrawnCoords.value, coords);
+				if (pixelsToDraw.length > 0) {
+					for (const pixel of pixelsToDraw) {
+						const color = props.isEraserMode ? "rgba(0,0,0,0)" : props.selectedColor!;
+						drawPixelOnCanvas(pixel, color);
+					}
+					lastDrawnCoords.value = coords;
+				}
 			}
 		}
 
@@ -665,11 +866,18 @@ onMounted(async () => {
 		// Lock drawing mode when spacebar held down
 		if (e.code === "Space" && !e.repeat && props.isDrawing) {
 			e.preventDefault();
+
+			// TODO: Needed?
+			if (props.currentCharges ?? 0 <= 0) {
+				return;
+			}
+
 			isDrawingActive.value = true;
 
 			if (hoverCoords.value) {
 				lastDrawnCoords.value = hoverCoords.value;
-				emit("drawPixels", [hoverCoords.value]);
+				const color = props.isEraserMode ? "rgba(0,0,0,0)" : props.selectedColor!;
+				drawPixelOnCanvas(hoverCoords.value, color);
 			}
 		}
 	};
@@ -759,37 +967,10 @@ onMounted(async () => {
 	globalThis.addEventListener("touchstart", handleActivity);
 });
 
-watch(() => props.pixels, newPixels => {
-	// Draw pixels on canvas
-	for (const pixel of newPixels) {
-		drawPixelOnCanvas(pixel.tileCoords, pixel.color);
-	}
-}, { deep: true });
 
-watch(pixelGeoJSON, () => {
-	const pixels = map?.getSource("openplace-pixels");
-	if (pixels && "setData" in pixels && typeof pixels.setData === "function") {
-		pixels.setData(pixelGeoJSON.value);
-	}
-}, { deep: true });
+watch([() => props.selectedPixelCoords, hoverCoords], updateHoverGeoJSON);
 
-watch(pendingPixelBordersGeoJSON, () => {
-	const borders = map?.getSource("openplace-pending-pixels-border");
-	if (borders && "setData" in borders && typeof borders.setData === "function") {
-		borders.setData(pendingPixelBordersGeoJSON.value);
-	}
-}, { deep: true });
-
-watch(hoverGeoJSON, () => {
-	const pixels = map?.getSource("openplace-hover");
-	if (pixels && "setData" in pixels && typeof pixels.setData === "function") {
-		pixels.setData(hoverGeoJSON.value);
-	}
-}, { deep: true });
-
-watch(() => props.isDrawing, () => {
-	updateCursor();
-});
+watch(() => props.isDrawing, updateCursor);
 
 watch(() => props.isSatellite, () => {
 	if (map) {
@@ -797,15 +978,11 @@ watch(() => props.isSatellite, () => {
 	}
 });
 
-watch(() => props.favoriteLocations, () => {
-	updateFavoriteMarkers();
-}, { deep: true });
+watch(() => props.favoriteLocations, updateFavoriteMarkers, { deep: true });
 
 onUnmounted(() => {
 	for (const marker of favoriteMarkers) {
-		if (marker && typeof (marker as { remove: () => void }).remove === "function") {
-			(marker as { remove: () => void }).remove();
-		}
+		marker.remove();
 	}
 	favoriteMarkers.length = 0;
 
@@ -867,7 +1044,12 @@ const hasUncommittedPixels = () => {
 defineExpose({
 	cancelPaint,
 	commitCanvases,
+	clearPendingCanvases,
 	drawPixelOnCanvas,
+	erasePendingPixel,
+	getAllPendingPixels,
+	getPendingPixel,
+	refreshTiles,
 	resetBearing,
 	flyToLocation,
 	jumpToLocation,

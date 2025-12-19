@@ -47,12 +47,6 @@ export function snapToPixelGrid(lngLat: LngLat): LngLat {
 	return tileCoordsToLngLat(lngLatToTileCoords(lngLat));
 }
 
-export function getPixelId(coords: TileCoords): string {
-	const [tileX, tileY] = coords.tile;
-	const [x, y] = coords.pixel;
-	return `${tileX}-${tileY}-${x}-${y}`;
-}
-
 export function getPixelBounds(coords: TileCoords, inset = 0): {
 	topLeft: LngLat;
 	topRight: LngLat;

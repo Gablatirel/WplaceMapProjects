@@ -14,15 +14,17 @@
 			<MapComponent
 				ref="mapRef"
 				:initial-location="initialLocation"
-				:pixels="pixels"
 				:is-drawing="isPaintOpen"
 				:is-satellite="isSatellite"
+				:selected-color="selectedColor"
+				:is-eraser-mode="isEraserMode"
+				:current-charges="currentCharges"
 				:favorite-locations="userProfile?.favoriteLocations"
 				:selected-pixel-coords="selectedPixelCoords"
 				@map-click="handleMapClick"
 				@map-right-click="handleMapRightClick"
-				@draw-pixels="handleDrawPixels"
 				@bearing-change="mapBearing = $event"
+				@pixel-count-change="pendingPixelCount = $event"
 				@favorite-click="handleFavoriteClick"
 				@save-current-location="saveCurrentLocation"
 			/>
@@ -161,7 +163,7 @@
 					:is-eraser-mode="isEraserMode"
 					:charges="currentCharges ?? 0"
 					:max-charges="maxCharges ?? 0"
-					:pixel-count="pixels.length"
+					:pixel-count="pendingPixelCount"
 					:time-until-next="formattedTime"
 					:extra-colors-bitmap="userProfile?.extraColorsBitmap ?? 0"
 					@close="handleClosePaint"
@@ -217,7 +219,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import Toast from "primevue/toast";
 import OverlayBadge from "primevue/overlaybadge";
-import MapComponent, { type LocationWithZoom } from "~/components/Map.vue";
+import MapComponent, { type LocationWithZoom, type Pixel } from "~/components/Map.vue";
 import PaintButton from "~/components/PaintButton.vue";
 import ColorPalette from "~/components/ColorPalette.vue";
 import UserAvatar from "~/components/UserAvatar.vue";
@@ -225,7 +227,7 @@ import UserMenu from "~/components/UserMenu.vue";
 import PixelInfo from "~/components/PixelInfo.vue";
 import NotificationDialog from "~/components/NotificationDialog.vue";
 import StoreDialog, { StoreTab } from "~/components/StoreDialog.vue";
-import { CLOSE_ZOOM_LEVEL, getPixelId, type LngLat, lngLatToTileCoords, type TileCoords, tileCoordsToLngLat, WIDE_ZOOM_LEVEL, ZOOM_LEVEL } from "~/utils/coordinates";
+import { CLOSE_ZOOM_LEVEL, type LngLat, lngLatToTileCoords, type TileCoords, tileCoordsToLngLat, WIDE_ZOOM_LEVEL, ZOOM_LEVEL } from "~/utils/coordinates";
 import { type UserProfile, useUserProfile } from "~/composables/useUserProfile";
 import { useCharges } from "~/composables/useCharges";
 import { usePaint } from "~/composables/usePaint";
@@ -235,12 +237,6 @@ import { useTheme } from "~/composables/useTheme";
 import { useViewport } from "~/composables/useViewport";
 import SearchBox from "~/components/SearchBox.vue";
 import { DEFAULT_LOCATIONS } from "~/utils/default-locations";
-
-interface Pixel {
-	id: string;
-	tileCoords: TileCoords;
-	color: string;
-}
 
 const USER_RELOAD_INTERVAL = 15_000;
 const DEFAULT_COORDS = DEFAULT_LOCATIONS.map(({ coords }) => coords);
@@ -256,8 +252,8 @@ const isSearchOpen = ref(false);
 const notificationCount = ref(0);
 const selectedColor = ref("rgba(0,0,0,1)");
 const isEraserMode = ref(false);
-const pixels = ref<Pixel[]>([]);
 const selectedPixelCoords = ref<TileCoords | null>(null);
+const pendingPixelCount = ref(0);
 const userProfile = ref<UserProfile | null>(null);
 const isLoading = ref(true);
 const userMenuRef = ref();
@@ -487,9 +483,7 @@ const popMapLocation = () => {
 };
 
 const clearPendingPixels = () => {
-	const pixelCount = pixels.value.length;
-	pixels.value = [];
-	for (let i = 0; i < pixelCount; i++) {
+	for (let i = 0; i < pendingPixelCount.value; i++) {
 		incrementCharge();
 	}
 
@@ -514,20 +508,24 @@ const handlePurchaseColor = () => {
 };
 
 const handleSubmitPixels = async () => {
-	if (pixels.value.length === 0) {
+	if (pendingPixelCount.value === 0) {
 		return;
 	}
 
 	try {
-		const paintPixels = pixels.value.map(({ tileCoords, color }) => ({ tileCoords, color }));
-		await submitPixels(paintPixels);
+		const paintPixels = mapRef.value?.getAllPendingPixels?.() ?? [];
+		const submitData = paintPixels.map((pixel: Pixel) => ({ tileCoords: pixel.coords, color: pixel.color }));
+		await submitPixels(submitData);
 
 		// Commit the painted pixels to our local state
 		mapRef.value?.commitCanvases();
 		commitPixels();
 
+		// Refresh tiles from the server
+		mapRef.value?.refreshTiles();
+		mapRef.value?.clearPendingCanvases();
+
 		// Reset state
-		pixels.value = [];
 		isPaintOpen.value = false;
 		isEraserMode.value = false;
 	} catch (error) {
@@ -553,63 +551,29 @@ const handleKeyDown = (event: KeyboardEvent) => {
 	}
 };
 
-const erasePixelAtCoords = (tileCoords: TileCoords) => {
-	const pixelId = getPixelId(tileCoords);
-	const existingPixelIndex = pixels.value.findIndex(item => item.id === pixelId);
-
-	if (existingPixelIndex !== -1) {
-		pixels.value = pixels.value.filter((_, index) => index !== existingPixelIndex);
-		incrementCharge();
-		mapRef.value?.drawPixelOnCanvas(tileCoords, "rgba(0,0,0,0)");
-	}
-};
-
-const drawPixelAtCoords = (tileCoords: TileCoords) => {
+const drawPixelAtCoords = ({ tile, pixel }: TileCoords) => {
 	if (!isPaintOpen.value) {
 		return;
 	}
 
 	if (isEraserMode.value) {
 		// Eraser mode
-		erasePixelAtCoords(tileCoords);
+		const pendingPixel = mapRef.value?.getPendingPixel?.({ tile, pixel });
+		if (pendingPixel) {
+			mapRef.value?.erasePendingPixel({ tile, pixel });
+			decrementCharge();
+		}
 	} else {
 		// Paint mode
-		if (currentCharges.value === null) {
-			return;
-		}
-
-		if (currentCharges.value <= 0) {
-			showToast({
-				severity: "warn",
-				summary: "Not enough charges"
-			});
-			return;
-		}
-
-		const pixelId = getPixelId(tileCoords);
-		const existingPixelIndex = pixels.value.findIndex(item => item.id === pixelId);
-		const newPixel: Pixel = {
-			id: pixelId,
-			tileCoords,
-			color: selectedColor.value
-		};
-
-		if (existingPixelIndex === -1) {
-			pixels.value.push(newPixel);
+		const existingPixel = mapRef.value?.getPendingPixel?.({ tile, pixel });
+		if (existingPixel?.color !== selectedColor.value) {
+			mapRef.value?.drawPixelOnCanvas({ tile, pixel }, selectedColor.value);
 			decrementCharge();
-		} else {
-			pixels.value[existingPixelIndex] = newPixel;
 		}
 	}
 };
 
 const drawPixel = (coords: LngLat) => drawPixelAtCoords(lngLatToTileCoords(coords));
-
-const handleDrawPixels = (coords: TileCoords[]) => {
-	for (const coord of coords) {
-		drawPixelAtCoords(coord);
-	}
-};
 
 let lastClickTime = 0;
 const DOUBLE_CLICK_THRESHOLD = 300;
@@ -648,8 +612,11 @@ const handleMapRightClick = (event: LngLat) => {
 	}
 
 	// Right-click in paint mode to erase
+	const wasErasing = isEraserMode.value;
+	isEraserMode.value = true;
 	const tileCoords = lngLatToTileCoords(event);
-	erasePixelAtCoords(tileCoords);
+	drawPixelAtCoords(tileCoords);
+	isEraserMode.value = wasErasing;
 };
 
 const toggleUserMenu = (event: Event) => {
