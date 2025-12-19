@@ -161,7 +161,7 @@
 					:is-eraser-mode="isEraserMode"
 					:charges="currentCharges ?? 0"
 					:max-charges="maxCharges ?? 0"
-					:pixel-count="pendingPixelCount"
+					:pixel-count="pixels.length"
 					:time-until-next="formattedTime"
 					:extra-colors-bitmap="userProfile?.extraColorsBitmap ?? 0"
 					@close="handleClosePaint"
