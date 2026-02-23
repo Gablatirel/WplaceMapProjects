@@ -16,18 +16,18 @@
     "@fontsource-variable/pixelify-sans": "^5.2.7",
     "@primeuix/themes": "^1.2.5",
     "bootstrap": "^5.3.8",
-    "maplibre-gl": "^5.17.0",
+    "maplibre-gl": "^5.19.0",
     "moment": "^2.30.1",
     "nuxt": "~4.1.3",
     "primevue": "^4.5.4",
     "sass-embedded": "^1.97.3",
-    "vue": "^3.5.27",
+    "vue": "^3.5.28",
     "vue-router": "^4.6.3"
   },
   "devDependencies": {
-    "@nuxt/eslint": "^1.13.0",
+    "@nuxt/eslint": "^1.15.1",
     "@primevue/nuxt-module": "^4.5.4",
-    "@types/node": "^25.2.0",
+    "@types/node": "^25.3.0",
     "eslint": "^9.39.2",
     "eslint-config-chariz": "^2.1.0"
   },
